@@ -1,0 +1,603 @@
+"""Hybrid fractal-Z image codec.
+
+This is a functional reference implementation of a transform-domain image
+compressor built around three layers:
+
+1) block DCT for the main coding stage,
+2) a directional-state layer that plays a shearlet-like role in guiding the
+   recursive traversal order,
+3) multi-pass Haar-wavelet residual coding for refinement.
+
+The codec is intentionally self-contained (NumPy + stdlib only) and aims to be
+hackable rather than state-of-the-art.
+
+Usage:
+    python fractal_hfz_codec.py encode input.png output.hfz --quality 55
+    python fractal_hfz_codec.py decode output.hfz reconstructed.png
+
+The file format is a zlib-friendly LZMA-compressed pickle blob with a small
+magic header.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import lzma
+import math
+import pickle
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+import numpy as np
+
+MAGIC = b"HFZ1"
+
+
+# ----------------------------------------------------------------------------
+# Utility helpers
+# ----------------------------------------------------------------------------
+
+
+def _as_float64(a: np.ndarray) -> np.ndarray:
+    return np.asarray(a, dtype=np.float64)
+
+
+def pad_to_multiple(arr: np.ndarray, multiple: int, mode: str = "reflect") -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Pad HxW or HxWxC array so H and W are multiples of `multiple`."""
+    if multiple <= 1:
+        return arr, (0, 0)
+    h, w = arr.shape[:2]
+    pad_h = (multiple - (h % multiple)) % multiple
+    pad_w = (multiple - (w % multiple)) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return arr, (0, 0)
+    pad_spec = ((0, pad_h), (0, pad_w))
+    if arr.ndim == 3:
+        pad_spec = pad_spec + ((0, 0),)
+    return np.pad(arr, pad_spec, mode=mode), (pad_h, pad_w)
+
+
+def crop_to_shape(arr: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    h, w = shape
+    if arr.ndim == 2:
+        return arr[:h, :w]
+    return arr[:h, :w, ...]
+
+
+def split_channels(image: np.ndarray) -> List[np.ndarray]:
+    if image.ndim == 2:
+        return [image]
+    if image.ndim == 3:
+        return [image[..., i] for i in range(image.shape[2])]
+    raise ValueError("Expected 2D grayscale or 3D color image array.")
+
+
+def stack_channels(channels: Sequence[np.ndarray]) -> np.ndarray:
+    if len(channels) == 1:
+        return channels[0]
+    return np.stack(channels, axis=-1)
+
+
+# ----------------------------------------------------------------------------
+# DCT / IDCT
+# ----------------------------------------------------------------------------
+
+
+_DCT_CACHE: Dict[int, np.ndarray] = {}
+
+
+def dct_matrix(n: int) -> np.ndarray:
+    if n not in _DCT_CACHE:
+        c = np.zeros((n, n), dtype=np.float64)
+        scale0 = math.sqrt(1.0 / n)
+        scale = math.sqrt(2.0 / n)
+        for k in range(n):
+            alpha = scale0 if k == 0 else scale
+            for i in range(n):
+                c[k, i] = alpha * math.cos(math.pi * (2 * i + 1) * k / (2 * n))
+        _DCT_CACHE[n] = c
+    return _DCT_CACHE[n]
+
+
+def dct2(block: np.ndarray) -> np.ndarray:
+    block = _as_float64(block)
+    n, m = block.shape
+    if n != m:
+        raise ValueError("dct2 expects square blocks")
+    c = dct_matrix(n)
+    return c @ block @ c.T
+
+
+def idct2(coeff: np.ndarray) -> np.ndarray:
+    coeff = _as_float64(coeff)
+    n, m = coeff.shape
+    if n != m:
+        raise ValueError("idct2 expects square blocks")
+    c = dct_matrix(n)
+    return c.T @ coeff @ c
+
+
+# ----------------------------------------------------------------------------
+# Haar wavelet lift (multi-level, self-contained)
+# ----------------------------------------------------------------------------
+
+
+def _even_pad(arr: np.ndarray, multiple: int) -> Tuple[np.ndarray, Tuple[int, int]]:
+    return pad_to_multiple(arr, multiple, mode="reflect")
+
+
+def haar_dwt2(arr: np.ndarray, levels: int = 1) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """Multi-level 2D Haar transform.
+
+    Returns the coefficient image and the pad applied to make the input
+    divisible by 2**levels.
+    """
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    multiple = 2 ** levels
+    x, pad = _even_pad(_as_float64(arr), multiple)
+    out = x.copy()
+    h, w = out.shape
+    for lev in range(levels):
+        hh = h >> lev
+        ww = w >> lev
+        if hh % 2 != 0 or ww % 2 != 0:
+            raise RuntimeError("Internal padding error in haar_dwt2")
+        sub = out[:hh, :ww]
+        rows_lo = (sub[:, 0::2] + sub[:, 1::2]) * 0.5
+        rows_hi = (sub[:, 0::2] - sub[:, 1::2]) * 0.5
+        ll = (rows_lo[0::2, :] + rows_lo[1::2, :]) * 0.5
+        lh = (rows_lo[0::2, :] - rows_lo[1::2, :]) * 0.5
+        hl = (rows_hi[0::2, :] + rows_hi[1::2, :]) * 0.5
+        hh_band = (rows_hi[0::2, :] - rows_hi[1::2, :]) * 0.5
+        out[: hh // 2, : ww // 2] = ll
+        out[: hh // 2, ww // 2 : ww] = lh
+        out[hh // 2 : hh, : ww // 2] = hl
+        out[hh // 2 : hh, ww // 2 : ww] = hh_band
+    return out, pad
+
+
+def haar_idwt2(coeffs: np.ndarray, levels: int = 1, pad: Tuple[int, int] = (0, 0)) -> np.ndarray:
+    if levels < 1:
+        raise ValueError("levels must be >= 1")
+    out = _as_float64(coeffs).copy()
+    h, w = out.shape
+    for lev in reversed(range(levels)):
+        hh = h >> lev
+        ww = w >> lev
+        ll = out[: hh // 2, : ww // 2]
+        lh = out[: hh // 2, ww // 2 : ww]
+        hl = out[hh // 2 : hh, : ww // 2]
+        hh_band = out[hh // 2 : hh, ww // 2 : ww]
+
+        rows_lo = np.empty((hh, ww // 2), dtype=np.float64)
+        rows_hi = np.empty((hh, ww // 2), dtype=np.float64)
+        rows_lo[0::2, :] = ll + lh
+        rows_lo[1::2, :] = ll - lh
+        rows_hi[0::2, :] = hl + hh_band
+        rows_hi[1::2, :] = hl - hh_band
+
+        sub = np.empty((hh, ww), dtype=np.float64)
+        sub[:, 0::2] = rows_lo + rows_hi
+        sub[:, 1::2] = rows_lo - rows_hi
+        out[:hh, :ww] = sub
+    if pad != (0, 0):
+        out = out[: out.shape[0] - pad[0], : out.shape[1] - pad[1]]
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Directional state (shearlet proxy)
+# ----------------------------------------------------------------------------
+
+
+def block_orientation_state(block: np.ndarray) -> Tuple[int, float]:
+    """Return an 8-state orientation index and anisotropy measure.
+
+    This is a compact directional proxy inspired by shearlet orientation
+    selection. It is not a literal shearlet transform; it is a cheap directional
+    state used to steer the traversal and per-block mask.
+    """
+    b = _as_float64(block)
+    gx = b[:, 1:] - b[:, :-1]
+    gy = b[1:, :] - b[:-1, :]
+    if gx.size == 0 or gy.size == 0:
+        return 0, 0.0
+    gx = gx[:-1, :]
+    gy = gy[:, :-1]
+    if gx.size == 0 or gy.size == 0:
+        return 0, 0.0
+    gxx = float(np.mean(gx * gx))
+    gyy = float(np.mean(gy * gy))
+    gxy = float(np.mean(gx * gy))
+    denom = gxx + gyy + 1e-9
+    anis = math.sqrt((gxx - gyy) ** 2 + 4.0 * gxy * gxy) / denom
+    theta = 0.5 * math.atan2(2.0 * gxy, gxx - gyy)  # [-pi/2, pi/2]
+    # Map undirected orientation to 8 bins.
+    theta = theta % math.pi
+    state = int((theta / math.pi) * 8.0) % 8
+    if anis < 0.08:
+        state = 0
+    return state, anis
+
+
+# Quadrant ordering for recursive traversal.
+# Quadrants are [NW, NE, SW, SE].
+_QUAD_PERMS: Dict[int, Tuple[int, ...]] = {
+    0: (0, 1, 2, 3),
+    1: (1, 3, 0, 2),
+    2: (3, 2, 1, 0),
+    3: (2, 0, 3, 1),
+    4: (0, 2, 1, 3),
+    5: (2, 3, 0, 1),
+    6: (3, 1, 2, 0),
+    7: (1, 0, 3, 2),
+}
+
+
+def _weighted_mode(values: np.ndarray, weights: np.ndarray, nstates: int = 8) -> int:
+    flat_v = values.astype(np.int64).ravel()
+    flat_w = weights.astype(np.float64).ravel()
+    if flat_v.size == 0:
+        return 0
+    counts = np.bincount(flat_v, weights=flat_w, minlength=nstates)
+    return int(np.argmax(counts))
+
+
+def build_fractal_order(state_grid: np.ndarray, energy_grid: np.ndarray) -> List[Tuple[int, int]]:
+    """Recursive Morton-like order with orientation-driven child permutation."""
+    ny, nx = state_grid.shape
+    order: List[Tuple[int, int]] = []
+
+    def rec(y0: int, y1: int, x0: int, x1: int) -> None:
+        h = y1 - y0
+        w = x1 - x0
+        if h <= 0 or w <= 0:
+            return
+        if h == 1 and w == 1:
+            order.append((y0, x0))
+            return
+        region_states = state_grid[y0:y1, x0:x1]
+        region_energy = energy_grid[y0:y1, x0:x1]
+        dominant_state = _weighted_mode(region_states, region_energy)
+
+        if h > 1 and w > 1:
+            ym = y0 + h // 2
+            xm = x0 + w // 2
+            rects = [
+                (y0, ym, x0, xm),  # NW
+                (y0, ym, xm, x1),  # NE
+                (ym, y1, x0, xm),  # SW
+                (ym, y1, xm, x1),  # SE
+            ]
+        elif h > 1:
+            ym = y0 + h // 2
+            rects = [
+                (y0, ym, x0, x1),
+                (ym, y1, x0, x1),
+            ]
+        else:
+            xm = x0 + w // 2
+            rects = [
+                (y0, y1, x0, xm),
+                (y0, y1, xm, x1),
+            ]
+
+        perm = _QUAD_PERMS[dominant_state]
+        perm = tuple(i for i in perm if i < len(rects))
+        if len(rects) == 2 and dominant_state % 2 == 1:
+            perm = (1, 0)
+        for i in perm:
+            yy0, yy1, xx0, xx1 = rects[i]
+            rec(yy0, yy1, xx0, xx1)
+
+    rec(0, ny, 0, nx)
+    return order
+
+
+# ----------------------------------------------------------------------------
+# Block coding
+# ----------------------------------------------------------------------------
+
+
+def _quality_to_qbase(quality: int) -> float:
+    quality = int(np.clip(quality, 1, 100))
+    # Larger quality -> smaller quantization step.
+    return max(0.55, 18.0 / math.sqrt(quality + 1.0))
+
+
+def _mode_from_features(total_energy: float, hf_energy: float, anisotropy: float, q: int) -> int:
+    """Classify a block into smooth / directional / textured."""
+    ratio = hf_energy / (total_energy + 1e-9)
+    if ratio < 0.22 or total_energy < (8.0 + (100 - q) * 0.2):
+        return 0
+    if anisotropy > 0.30:
+        return 1
+    return 2
+
+
+def _keep_radius(mode: int, quality: int) -> int:
+    base = {0: 2, 1: 3, 2: 4}[mode]
+    if quality >= 85:
+        base += 1
+    elif quality <= 25:
+        base = max(1, base - 1)
+    return int(np.clip(base, 1, 6))
+
+
+def _quantize_dct(coeff: np.ndarray, quality: int, mode: int) -> np.ndarray:
+    qbase = _quality_to_qbase(quality)
+    keep = _keep_radius(mode, quality)
+    mode_scale = {0: 1.9, 1: 1.15, 2: 0.95}[mode]
+    qstep = qbase * mode_scale
+    n = coeff.shape[0]
+    out = np.zeros_like(coeff, dtype=np.int16)
+    for u in range(n):
+        for v in range(n):
+            if (u + v) < keep:
+                val = np.round(coeff[u, v] / (qstep * (1.0 + 0.18 * (u + v))))
+                out[u, v] = np.int16(np.clip(val, -32768, 32767))
+    return out
+
+
+def _dequantize_dct(qcoeff: np.ndarray, quality: int, mode: int) -> np.ndarray:
+    qbase = _quality_to_qbase(quality)
+    keep = _keep_radius(mode, quality)
+    mode_scale = {0: 1.9, 1: 1.15, 2: 0.95}[mode]
+    qstep = qbase * mode_scale
+    qcoeff = qcoeff.astype(np.float64)
+    n = qcoeff.shape[0]
+    out = np.zeros_like(qcoeff, dtype=np.float64)
+    for u in range(n):
+        for v in range(n):
+            if (u + v) < keep:
+                out[u, v] = qcoeff[u, v] * qstep * (1.0 + 0.18 * (u + v))
+    return out
+
+
+@dataclass
+class ChannelCodecResult:
+    padded_shape: Tuple[int, int]
+    pad_hw: Tuple[int, int]
+    block_size: int
+    quality: int
+    order: np.ndarray
+    state_grid: np.ndarray
+    mode_grid: np.ndarray
+    dct_qcoeffs: np.ndarray  # [nblocks, bs, bs]
+    residual_pads: List[Tuple[int, int]]
+    residual_qsteps: List[float]
+    residual_coeffs: List[np.ndarray]  # each [Hp, Wp]
+
+
+class FractalHybridCodec:
+    def __init__(self, block_size: int = 8, residual_levels: int = 2, residual_passes: int = 2):
+        if block_size < 4 or (block_size & (block_size - 1)) != 0:
+            raise ValueError("block_size should be a power of two >= 4 for best results")
+        self.block_size = int(block_size)
+        self.residual_levels = int(residual_levels)
+        self.residual_passes = int(residual_passes)
+        if self.residual_passes < 1:
+            raise ValueError("residual_passes must be >= 1")
+        if self.residual_levels < 1:
+            raise ValueError("residual_levels must be >= 1")
+
+    # ----- channel encode/decode -----
+
+    def _encode_channel(self, channel: np.ndarray, quality: int) -> ChannelCodecResult:
+        ch = _as_float64(channel)
+        padded, pad_hw = pad_to_multiple(ch, self.block_size, mode="reflect")
+        h, w = padded.shape
+        bs = self.block_size
+        ny, nx = h // bs, w // bs
+
+        state_grid = np.zeros((ny, nx), dtype=np.uint8)
+        mode_grid = np.zeros((ny, nx), dtype=np.uint8)
+        energy_grid = np.zeros((ny, nx), dtype=np.float64)
+        blocks: List[np.ndarray] = []
+        coeff_blocks: List[np.ndarray] = []
+
+        for by in range(ny):
+            for bx in range(nx):
+                block = padded[by * bs : (by + 1) * bs, bx * bs : (bx + 1) * bs]
+                centered = block - 128.0
+                coeff = dct2(centered)
+                blocks.append(block)
+                coeff_blocks.append(coeff)
+                total_energy = float(np.sum(np.abs(coeff)))
+                hf_energy = float(np.sum(np.abs(coeff[2:, 2:]))) if bs > 2 else 0.0
+                st, anis = block_orientation_state(block)
+                mode = _mode_from_features(total_energy, hf_energy, anis, quality)
+                state_grid[by, bx] = st
+                mode_grid[by, bx] = mode
+                energy_grid[by, bx] = hf_energy + 1e-6
+
+        order_xy = build_fractal_order(state_grid, energy_grid)
+        order = np.array([y * nx + x for (y, x) in order_xy], dtype=np.int32)
+
+        dct_qcoeffs = np.zeros((ny * nx, bs, bs), dtype=np.int16)
+        for idx, (y, x) in enumerate(order_xy):
+            bidx = y * nx + x
+            dct_qcoeffs[idx] = _quantize_dct(coeff_blocks[bidx], quality, int(mode_grid[y, x]))
+
+        # Reconstruct pass 1.
+        recon1 = np.zeros_like(padded, dtype=np.float64)
+        for idx, (y, x) in enumerate(order_xy):
+            qcoeff = dct_qcoeffs[idx]
+            mode = int(mode_grid[y, x])
+            coeff = _dequantize_dct(qcoeff, quality, mode)
+            block = idct2(coeff) + 128.0
+            recon1[y * bs : (y + 1) * bs, x * bs : (x + 1) * bs] = block
+
+        residual = padded - recon1
+        residual_coeffs: List[np.ndarray] = []
+        residual_pads: List[Tuple[int, int]] = []
+        residual_qsteps: List[float] = []
+        current = recon1.copy()
+
+        for p in range(self.residual_passes):
+            resid = padded - current
+            resid_pad, pad_info = pad_to_multiple(resid, 2 ** self.residual_levels, mode="reflect")
+            coeffs, _ = haar_dwt2(resid_pad, levels=self.residual_levels)
+            # Quantize residual more gently than the block DCT stage.
+            qstep = max(0.20, _quality_to_qbase(quality) * (0.70 ** p) * 0.55)
+            qcoeffs = np.round(coeffs / qstep).astype(np.int16)
+            residual_coeffs.append(qcoeffs)
+            residual_pads.append(pad_info)
+            residual_qsteps.append(float(qstep))
+            recon_resid = haar_idwt2(qcoeffs.astype(np.float64) * qstep, levels=self.residual_levels, pad=pad_info)
+            current = current + recon_resid
+
+        return ChannelCodecResult(
+            padded_shape=(h, w),
+            pad_hw=pad_hw,
+            block_size=bs,
+            quality=int(quality),
+            order=order,
+            state_grid=state_grid,
+            mode_grid=mode_grid,
+            dct_qcoeffs=dct_qcoeffs,
+            residual_pads=residual_pads,
+            residual_qsteps=residual_qsteps,
+            residual_coeffs=residual_coeffs,
+        )
+
+    def _decode_channel(self, data: ChannelCodecResult) -> np.ndarray:
+        h, w = data.padded_shape
+        bs = data.block_size
+        ny, nx = h // bs, w // bs
+        recon = np.zeros((h, w), dtype=np.float64)
+
+        order_xy = [(int(o // nx), int(o % nx)) for o in data.order]
+        for idx, (y, x) in enumerate(order_xy):
+            mode = int(data.mode_grid[y, x])
+            qcoeff = data.dct_qcoeffs[idx]
+            coeff = _dequantize_dct(qcoeff, data.quality, mode)
+            block = idct2(coeff) + 128.0
+            recon[y * bs : (y + 1) * bs, x * bs : (x + 1) * bs] = block
+
+        for qcoeffs, qstep, pad_info in zip(data.residual_coeffs, data.residual_qsteps, data.residual_pads):
+            resid = haar_idwt2(qcoeffs.astype(np.float64) * qstep, levels=self.residual_levels, pad=pad_info)
+            resid = crop_to_shape(resid, (h, w))
+            recon = recon + resid
+
+        recon = np.clip(np.round(recon), 0, 255).astype(np.uint8)
+        return crop_to_shape(recon, (h - data.pad_hw[0], w - data.pad_hw[1]))
+
+    # ----- public API -----
+
+    def compress(self, image: np.ndarray, quality: int = 55) -> bytes:
+        """Compress a uint8 image array into bytes."""
+        arr = np.asarray(image)
+        if arr.dtype != np.uint8:
+            arr = np.clip(np.round(arr), 0, 255).astype(np.uint8)
+
+        channels = split_channels(arr)
+        encoded_channels = [self._encode_channel(ch, quality) for ch in channels]
+
+        payload = {
+            "version": 1,
+            "shape": tuple(arr.shape),
+            "dtype": "uint8",
+            "quality": int(np.clip(quality, 1, 100)),
+            "block_size": self.block_size,
+            "residual_levels": self.residual_levels,
+            "residual_passes": self.residual_passes,
+            "channels": encoded_channels,
+        }
+        raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        return MAGIC + lzma.compress(raw, preset=6)
+
+    def decompress(self, blob: bytes) -> np.ndarray:
+        if not blob.startswith(MAGIC):
+            raise ValueError("Not a HFZ blob")
+        payload = pickle.loads(lzma.decompress(blob[len(MAGIC) :]))
+        if payload.get("version") != 1:
+            raise ValueError("Unsupported codec version")
+        if payload.get("block_size") != self.block_size:
+            # The stored data knows how it was encoded; this check is only advisory.
+            pass
+
+        channels = []
+        for ch_data in payload["channels"]:
+            channels.append(self._decode_channel(ch_data))
+        out = stack_channels(channels)
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        return out
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+
+
+def _load_image(path: Path) -> np.ndarray:
+    try:
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("Pillow is required for the CLI image loader") from exc
+    img = Image.open(path)
+    if img.mode not in ("L", "RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+    return np.array(img, dtype=np.uint8)
+
+
+def _save_image(path: Path, arr: np.ndarray) -> None:
+    try:
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("Pillow is required for the CLI image saver") from exc
+    Image.fromarray(arr).save(path)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Hybrid fractal-Z image compressor")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    enc = sub.add_parser("encode", help="Compress an image")
+    enc.add_argument("input", type=Path)
+    enc.add_argument("output", type=Path)
+    enc.add_argument("--quality", type=int, default=55, help="1..100, higher is better")
+    enc.add_argument("--block-size", type=int, default=8)
+    enc.add_argument("--residual-levels", type=int, default=2)
+    enc.add_argument("--residual-passes", type=int, default=2)
+
+    dec = sub.add_parser("decode", help="Decompress a .hfz file")
+    dec.add_argument("input", type=Path)
+    dec.add_argument("output", type=Path)
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "encode":
+        img = _load_image(args.input)
+        codec = FractalHybridCodec(
+            block_size=args.block_size,
+            residual_levels=args.residual_levels,
+            residual_passes=args.residual_passes,
+        )
+        blob = codec.compress(img, quality=args.quality)
+        args.output.write_bytes(blob)
+        print(f"Wrote {args.output} ({len(blob)} bytes)")
+        return 0
+
+    if args.cmd == "decode":
+        blob = args.input.read_bytes()
+        # We can decode with defaults because the payload contains its own parameters.
+        payload = pickle.loads(lzma.decompress(blob[len(MAGIC) :]))
+        codec = FractalHybridCodec(
+            block_size=int(payload.get("block_size", 8)),
+            residual_levels=int(payload.get("residual_levels", 2)),
+            residual_passes=int(payload.get("residual_passes", 2)),
+        )
+        arr = codec.decompress(blob)
+        _save_image(args.output, arr)
+        print(f"Wrote {args.output}")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
