@@ -80,7 +80,7 @@ def stack_channels(channels: Sequence[np.ndarray]) -> np.ndarray:
     return np.stack(channels, axis=-1)
 
 
-def rgb_to_ycbcr(rgb: np.ndarray) -> List[np.ndarray]:
+def rgb_to_ycbcr(rgb: np.ndarray, subsample: bool = True) -> List[np.ndarray]:
     """Convert RGB to YCbCr (BT.601)."""
     r = rgb[..., 0].astype(np.float64)
     g = rgb[..., 1].astype(np.float64)
@@ -88,11 +88,23 @@ def rgb_to_ycbcr(rgb: np.ndarray) -> List[np.ndarray]:
     y = 0.299 * r + 0.587 * g + 0.114 * b
     cb = 128 + -0.168736 * r - 0.331264 * g + 0.5 * b
     cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
+
+    if subsample:
+        # 4:2:0 subsampling: simple 2x2 average pooling
+        cb = (cb[0::2, 0::2] + cb[0::2, 1::2] + cb[1::2, 0::2] + cb[1::2, 1::2]) * 0.25
+        cr = (cr[0::2, 0::2] + cr[0::2, 1::2] + cr[1::2, 0::2] + cr[1::2, 1::2]) * 0.25
+
     return [y, cb, cr]
 
 
 def ycbcr_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
     """Convert YCbCr to RGB (BT.601)."""
+    # Upsample cb, cr if needed (4:2:0)
+    if cb.shape != y.shape:
+        # Simple nearest-neighbor upsampling
+        cb = np.repeat(np.repeat(cb, 2, axis=0), 2, axis=1)[:y.shape[0], :y.shape[1]]
+        cr = np.repeat(np.repeat(cr, 2, axis=0), 2, axis=1)[:y.shape[0], :y.shape[1]]
+
     y = y.astype(np.float64)
     cb = cb.astype(np.float64) - 128
     cr = cr.astype(np.float64) - 128
@@ -334,9 +346,9 @@ def _mode_from_features(total_energy: np.ndarray, hf_energy: np.ndarray, anisotr
     ratio = hf_energy / (total_energy + 1e-9)
     modes = np.zeros_like(total_energy, dtype=np.uint8)
     # Default is 0 (smooth)
-    mask_textured = (ratio >= 0.22) & (total_energy >= (8.0 + (100 - q) * 0.2))
+    mask_textured = (ratio >= 0.18) & (total_energy >= (5.0 + (100 - q) * 0.1))
     modes[mask_textured] = 2
-    mask_directional = mask_textured & (anisotropy > 0.30)
+    mask_directional = mask_textured & (anisotropy > 0.25)
     modes[mask_directional] = 1
     return modes
 
@@ -361,7 +373,7 @@ def _get_quant_params(quality: int, modes: np.ndarray, n: int) -> Tuple[np.ndarr
     return qsteps, keep
 
 
-def _quantize_dct(coeffs: np.ndarray, quality: int, modes: np.ndarray) -> np.ndarray:
+def _quantize_dct(coeffs: np.ndarray, quality: int, modes: np.ndarray, states: np.ndarray) -> np.ndarray:
     n = coeffs.shape[-1]
     qsteps, keep = _get_quant_params(quality, modes, n)
 
@@ -372,8 +384,26 @@ def _quantize_dct(coeffs: np.ndarray, quality: int, modes: np.ndarray) -> np.nda
     # masks: (N, n, n)
     masks = uv_sum[None, :, :] < keep[:, None, None]
 
+    # Directional pruning for mode 1 (directional)
+    # states: 0=smooth/none, 1-7=orientations
+    # If state > 0 and mode == 1, we can prune coefficients perpendicular to the dominant direction
+    # For simplicity, we'll use a rough heuristic: if u > v and mostly horizontal, or v > u and mostly vertical
+    directional_mask = np.ones(coeffs.shape, dtype=bool)
+    for s in range(1, 8):
+        s_mask = (modes == 1) & (states == s)
+        if not np.any(s_mask): continue
+
+        # angle = (s / 8) * pi
+        angle = (s / 8.0) * np.pi
+        # Perpendicular direction in DCT space
+        if 0.375 * np.pi <= angle <= 0.625 * np.pi: # Vertical-ish
+            directional_mask[s_mask, :, 1:] = False
+        elif angle <= 0.125 * np.pi or angle >= 0.875 * np.pi: # Horizontal-ish
+            directional_mask[s_mask, 1:, :] = False
+
+    masks &= directional_mask
+
     # qstep matrix: (N, n, n)
-    # qstep * (1.0 + 0.18 * (u + v))
     q_matrix = qsteps[:, None, None] * (1.0 + 0.25 * uv_sum[None, :, :])
 
     qcoeffs = np.zeros_like(coeffs, dtype=np.int16)
@@ -382,13 +412,26 @@ def _quantize_dct(coeffs: np.ndarray, quality: int, modes: np.ndarray) -> np.nda
     return qcoeffs
 
 
-def _dequantize_dct(qcoeffs: np.ndarray, quality: int, modes: np.ndarray) -> np.ndarray:
+def _dequantize_dct(qcoeffs: np.ndarray, quality: int, modes: np.ndarray, states: np.ndarray) -> np.ndarray:
     n = qcoeffs.shape[-1]
     qsteps, keep = _get_quant_params(quality, modes, n)
 
     u, v = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
     uv_sum = u + v
     masks = uv_sum[None, :, :] < keep[:, None, None]
+
+    # Must use same directional pruning logic
+    directional_mask = np.ones(qcoeffs.shape, dtype=bool)
+    for s in range(1, 8):
+        s_mask = (modes == 1) & (states == s)
+        if not np.any(s_mask): continue
+        angle = (s / 8.0) * np.pi
+        if 0.375 * np.pi <= angle <= 0.625 * np.pi:
+            directional_mask[s_mask, :, 1:] = False
+        elif angle <= 0.125 * np.pi or angle >= 0.875 * np.pi:
+            directional_mask[s_mask, 1:, :] = False
+    masks &= directional_mask
+
     q_matrix = qsteps[:, None, None] * (1.0 + 0.25 * uv_sum[None, :, :])
 
     coeffs = np.zeros(qcoeffs.shape, dtype=np.float64)
@@ -482,11 +525,12 @@ class FractalHybridCodec:
         # Reorder blocks for fractal traversal
         ordered_coeffs = coeff_blocks[order]
         ordered_modes = modes[order]
+        ordered_states = states[order]
 
-        dct_qcoeffs = _quantize_dct(ordered_coeffs, quality, ordered_modes)
+        dct_qcoeffs = _quantize_dct(ordered_coeffs, quality, ordered_modes, ordered_states)
 
         # Reconstruct pass 1.
-        recon_coeffs = _dequantize_dct(dct_qcoeffs, quality, ordered_modes)
+        recon_coeffs = _dequantize_dct(dct_qcoeffs, quality, ordered_modes, ordered_states)
         recon_blocks = idct2(recon_coeffs) + 128.0
 
         # Put blocks back into grid
@@ -504,10 +548,18 @@ class FractalHybridCodec:
 
         for p in range(self.residual_passes):
             resid = padded - current
+
+            # Mask residual based on mode_grid
+            # mode 0 (smooth) blocks get their residuals attenuated
+            mask = np.ones_like(mode_grid, dtype=np.float64)
+            mask[mode_grid == 0] = 0.50
+            # Upsample mask to pixel resolution
+            pixel_mask = np.repeat(np.repeat(mask, bs, axis=0), bs, axis=1)
+            resid = resid * pixel_mask
+
             resid_pad, pad_info = pad_to_multiple(resid, 2 ** self.residual_levels, mode="reflect")
             coeffs, _ = haar_dwt2(resid_pad, levels=self.residual_levels)
             # Quantize residual.
-            # Increased qstep to improve compression.
             qstep = max(0.5, _quality_to_qbase(quality) * (0.85 ** p) * 1.5)
             qcoeffs = np.round(coeffs / qstep)
             # Find appropriate integer type for residuals
@@ -543,12 +595,14 @@ class FractalHybridCodec:
         nblocks = ny * nx
 
         order = data.order
-        # We need modes in fractal order
+        # We need modes and states in fractal order
         flat_modes = data.mode_grid.ravel()
+        flat_states = data.state_grid.ravel()
         ordered_modes = flat_modes[order]
+        ordered_states = flat_states[order]
 
         dct_qcoeffs = _unpack_coefficients(data.dct_qcoeffs_packed, nblocks, bs)
-        recon_coeffs = _dequantize_dct(dct_qcoeffs, data.quality, ordered_modes)
+        recon_coeffs = _dequantize_dct(dct_qcoeffs, data.quality, ordered_modes, ordered_states)
         recon_blocks = idct2(recon_coeffs) + 128.0
 
         # Put blocks back into grid
@@ -574,7 +628,11 @@ class FractalHybridCodec:
 
         is_rgb = arr.ndim == 3 and arr.shape[2] == 3
         if is_rgb:
-            channels = rgb_to_ycbcr(arr)
+            # Pad to even dimensions for 4:2:0 subsampling
+            h, w = arr.shape[:2]
+            if h % 2 != 0 or w % 2 != 0:
+                arr, _ = pad_to_multiple(arr, 2, mode="reflect")
+            channels = rgb_to_ycbcr(arr, subsample=True)
         else:
             channels = split_channels(arr)
 
@@ -583,7 +641,8 @@ class FractalHybridCodec:
             # Chroma channels (Cb, Cr) can be quantized more aggressively
             ch_quality = quality
             if is_rgb and i > 0:
-                ch_quality = max(1, int(quality * 0.8))
+                # Subsampled chroma needs higher quality to maintain same perceptual level
+                ch_quality = max(1, int(quality * 1.0))
             encoded_channels.append(self._encode_channel(ch, ch_quality))
 
         payload = {
