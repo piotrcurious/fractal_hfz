@@ -80,6 +80,29 @@ def stack_channels(channels: Sequence[np.ndarray]) -> np.ndarray:
     return np.stack(channels, axis=-1)
 
 
+def rgb_to_ycbcr(rgb: np.ndarray) -> List[np.ndarray]:
+    """Convert RGB to YCbCr (BT.601)."""
+    r = rgb[..., 0].astype(np.float64)
+    g = rgb[..., 1].astype(np.float64)
+    b = rgb[..., 2].astype(np.float64)
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = 128 + -0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
+    return [y, cb, cr]
+
+
+def ycbcr_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
+    """Convert YCbCr to RGB (BT.601)."""
+    y = y.astype(np.float64)
+    cb = cb.astype(np.float64) - 128
+    cr = cr.astype(np.float64) - 128
+    r = y + 1.402 * cr
+    g = y - 0.344136 * cb - 0.714136 * cr
+    b = y + 1.772 * cb
+    rgb = np.stack([r, g, b], axis=-1)
+    return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+
+
 # ----------------------------------------------------------------------------
 # DCT / IDCT
 # ----------------------------------------------------------------------------
@@ -101,22 +124,22 @@ def dct_matrix(n: int) -> np.ndarray:
     return _DCT_CACHE[n]
 
 
-def dct2(block: np.ndarray) -> np.ndarray:
-    block = _as_float64(block)
-    n, m = block.shape
-    if n != m:
-        raise ValueError("dct2 expects square blocks")
+def dct2(blocks: np.ndarray) -> np.ndarray:
+    """Apply 2D DCT to a block or a batch of blocks (N, n, n)."""
+    blocks = _as_float64(blocks)
+    n = blocks.shape[-1]
     c = dct_matrix(n)
-    return c @ block @ c.T
+    # Using matrix multiplication that handles batches: (N, n, n)
+    # Equivalent to c @ blocks @ c.T for each block
+    return c @ blocks @ c.T
 
 
-def idct2(coeff: np.ndarray) -> np.ndarray:
-    coeff = _as_float64(coeff)
-    n, m = coeff.shape
-    if n != m:
-        raise ValueError("idct2 expects square blocks")
+def idct2(coeffs: np.ndarray) -> np.ndarray:
+    """Apply 2D IDCT to a block or a batch of blocks (N, n, n)."""
+    coeffs = _as_float64(coeffs)
+    n = coeffs.shape[-1]
     c = dct_matrix(n)
-    return c.T @ coeff @ c
+    return c.T @ coeffs @ c
 
 
 # ----------------------------------------------------------------------------
@@ -193,34 +216,32 @@ def haar_idwt2(coeffs: np.ndarray, levels: int = 1, pad: Tuple[int, int] = (0, 0
 # ----------------------------------------------------------------------------
 
 
-def block_orientation_state(block: np.ndarray) -> Tuple[int, float]:
-    """Return an 8-state orientation index and anisotropy measure.
+def block_orientation_state(blocks: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return an 8-state orientation index and anisotropy measure for a batch of blocks (N, H, W)."""
+    b = _as_float64(blocks)
+    # b: (N, H, W)
+    gx = b[:, :, 1:] - b[:, :, :-1]
+    gy = b[:, 1:, :] - b[:, :-1, :]
 
-    This is a compact directional proxy inspired by shearlet orientation
-    selection. It is not a literal shearlet transform; it is a cheap directional
-    state used to steer the traversal and per-block mask.
-    """
-    b = _as_float64(block)
-    gx = b[:, 1:] - b[:, :-1]
-    gy = b[1:, :] - b[:-1, :]
+    # Matching the behavior of the original for edge handling
+    gx = gx[:, :-1, :]
+    gy = gy[:, :, :-1]
+
     if gx.size == 0 or gy.size == 0:
-        return 0, 0.0
-    gx = gx[:-1, :]
-    gy = gy[:, :-1]
-    if gx.size == 0 or gy.size == 0:
-        return 0, 0.0
-    gxx = float(np.mean(gx * gx))
-    gyy = float(np.mean(gy * gy))
-    gxy = float(np.mean(gx * gy))
+        return np.zeros(len(b), dtype=np.uint8), np.zeros(len(b), dtype=np.float64)
+
+    gxx = np.mean(gx * gx, axis=(1, 2))
+    gyy = np.mean(gy * gy, axis=(1, 2))
+    gxy = np.mean(gx * gy, axis=(1, 2))
+
     denom = gxx + gyy + 1e-9
-    anis = math.sqrt((gxx - gyy) ** 2 + 4.0 * gxy * gxy) / denom
-    theta = 0.5 * math.atan2(2.0 * gxy, gxx - gyy)  # [-pi/2, pi/2]
+    anis = np.sqrt((gxx - gyy) ** 2 + 4.0 * gxy * gxy) / denom
+    theta = 0.5 * np.arctan2(2.0 * gxy, gxx - gyy)  # [-pi/2, pi/2]
     # Map undirected orientation to 8 bins.
-    theta = theta % math.pi
-    state = int((theta / math.pi) * 8.0) % 8
-    if anis < 0.08:
-        state = 0
-    return state, anis
+    theta = theta % np.pi
+    state = ( (theta / np.pi) * 8.0 ).astype(np.int32) % 8
+    state[anis < 0.08] = 0
+    return state.astype(np.uint8), anis
 
 
 # Quadrant ordering for recursive traversal.
@@ -308,53 +329,95 @@ def _quality_to_qbase(quality: int) -> float:
     return max(0.55, 18.0 / math.sqrt(quality + 1.0))
 
 
-def _mode_from_features(total_energy: float, hf_energy: float, anisotropy: float, q: int) -> int:
-    """Classify a block into smooth / directional / textured."""
+def _mode_from_features(total_energy: np.ndarray, hf_energy: np.ndarray, anisotropy: np.ndarray, q: int) -> np.ndarray:
+    """Classify blocks into smooth / directional / textured."""
     ratio = hf_energy / (total_energy + 1e-9)
-    if ratio < 0.22 or total_energy < (8.0 + (100 - q) * 0.2):
-        return 0
-    if anisotropy > 0.30:
-        return 1
-    return 2
+    modes = np.zeros_like(total_energy, dtype=np.uint8)
+    # Default is 0 (smooth)
+    mask_textured = (ratio >= 0.22) & (total_energy >= (8.0 + (100 - q) * 0.2))
+    modes[mask_textured] = 2
+    mask_directional = mask_textured & (anisotropy > 0.30)
+    modes[mask_directional] = 1
+    return modes
 
 
-def _keep_radius(mode: int, quality: int) -> int:
-    base = {0: 2, 1: 3, 2: 4}[mode]
+def _get_quant_params(quality: int, modes: np.ndarray, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Get qstep and keep radius for a batch of modes."""
+    qbase = _quality_to_qbase(quality)
+
+    # keep radius based on mode
+    keep_base = np.array([2, 3, 4], dtype=np.int32)
+    keep = keep_base[modes]
     if quality >= 85:
-        base += 1
+        keep += 1
     elif quality <= 25:
-        base = max(1, base - 1)
-    return int(np.clip(base, 1, 6))
+        keep = np.maximum(1, keep - 1)
+    keep = np.clip(keep, 1, n * 2)
+
+    # qstep based on mode
+    mode_scales = np.array([1.9, 1.15, 0.95], dtype=np.float64)
+    qsteps = qbase * mode_scales[modes]
+
+    return qsteps, keep
 
 
-def _quantize_dct(coeff: np.ndarray, quality: int, mode: int) -> np.ndarray:
-    qbase = _quality_to_qbase(quality)
-    keep = _keep_radius(mode, quality)
-    mode_scale = {0: 1.9, 1: 1.15, 2: 0.95}[mode]
-    qstep = qbase * mode_scale
-    n = coeff.shape[0]
-    out = np.zeros_like(coeff, dtype=np.int16)
-    for u in range(n):
-        for v in range(n):
-            if (u + v) < keep:
-                val = np.round(coeff[u, v] / (qstep * (1.0 + 0.18 * (u + v))))
-                out[u, v] = np.int16(np.clip(val, -32768, 32767))
-    return out
+def _quantize_dct(coeffs: np.ndarray, quality: int, modes: np.ndarray) -> np.ndarray:
+    n = coeffs.shape[-1]
+    qsteps, keep = _get_quant_params(quality, modes, n)
+
+    # Create a mask for (u+v) < keep
+    u, v = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+    uv_sum = u + v
+
+    # masks: (N, n, n)
+    masks = uv_sum[None, :, :] < keep[:, None, None]
+
+    # qstep matrix: (N, n, n)
+    # qstep * (1.0 + 0.18 * (u + v))
+    q_matrix = qsteps[:, None, None] * (1.0 + 0.25 * uv_sum[None, :, :])
+
+    qcoeffs = np.zeros_like(coeffs, dtype=np.int16)
+    vals = np.round(coeffs / q_matrix)
+    qcoeffs[masks] = np.clip(vals[masks], -32768, 32767).astype(np.int16)
+    return qcoeffs
 
 
-def _dequantize_dct(qcoeff: np.ndarray, quality: int, mode: int) -> np.ndarray:
-    qbase = _quality_to_qbase(quality)
-    keep = _keep_radius(mode, quality)
-    mode_scale = {0: 1.9, 1: 1.15, 2: 0.95}[mode]
-    qstep = qbase * mode_scale
-    qcoeff = qcoeff.astype(np.float64)
-    n = qcoeff.shape[0]
-    out = np.zeros_like(qcoeff, dtype=np.float64)
-    for u in range(n):
-        for v in range(n):
-            if (u + v) < keep:
-                out[u, v] = qcoeff[u, v] * qstep * (1.0 + 0.18 * (u + v))
-    return out
+def _dequantize_dct(qcoeffs: np.ndarray, quality: int, modes: np.ndarray) -> np.ndarray:
+    n = qcoeffs.shape[-1]
+    qsteps, keep = _get_quant_params(quality, modes, n)
+
+    u, v = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+    uv_sum = u + v
+    masks = uv_sum[None, :, :] < keep[:, None, None]
+    q_matrix = qsteps[:, None, None] * (1.0 + 0.25 * uv_sum[None, :, :])
+
+    coeffs = np.zeros(qcoeffs.shape, dtype=np.float64)
+    coeffs[masks] = qcoeffs[masks].astype(np.float64) * q_matrix[masks]
+    return coeffs
+
+
+def _zig_zag_indices(n: int) -> np.ndarray:
+    index_order = sorted(((i, j) for i in range(n) for j in range(n)),
+                         key=lambda x: (x[0] + x[1], x[1] if (x[0] + x[1]) % 2 == 0 else x[0]))
+    return np.array([i * n + j for i, j in index_order])
+
+
+def _pack_coefficients(qcoeffs: np.ndarray) -> np.ndarray:
+    """Pack a batch of blocks into a 1D array using zig-zag scan."""
+    n = qcoeffs.shape[-1]
+    indices = _zig_zag_indices(n)
+    flat = qcoeffs.reshape(-1, n * n)
+    return flat[:, indices].ravel()
+
+
+def _unpack_coefficients(packed: np.ndarray, nblocks: int, n: int) -> np.ndarray:
+    """Unpack a 1D array into a batch of blocks using zig-zag scan."""
+    indices = _zig_zag_indices(n)
+    rev_indices = np.zeros_like(indices)
+    rev_indices[indices] = np.arange(len(indices))
+
+    flat = packed.reshape(nblocks, n * n)
+    return flat[:, rev_indices].reshape(nblocks, n, n)
 
 
 @dataclass
@@ -366,7 +429,7 @@ class ChannelCodecResult:
     order: np.ndarray
     state_grid: np.ndarray
     mode_grid: np.ndarray
-    dct_qcoeffs: np.ndarray  # [nblocks, bs, bs]
+    dct_qcoeffs_packed: np.ndarray  # 1D zig-zag
     residual_pads: List[Tuple[int, int]]
     residual_qsteps: List[float]
     residual_coeffs: List[np.ndarray]  # each [Hp, Wp]
@@ -393,43 +456,45 @@ class FractalHybridCodec:
         bs = self.block_size
         ny, nx = h // bs, w // bs
 
-        state_grid = np.zeros((ny, nx), dtype=np.uint8)
-        mode_grid = np.zeros((ny, nx), dtype=np.uint8)
-        energy_grid = np.zeros((ny, nx), dtype=np.float64)
-        blocks: List[np.ndarray] = []
-        coeff_blocks: List[np.ndarray] = []
+        # Reshape into blocks: (ny, bs, nx, bs) -> (ny, nx, bs, bs)
+        reshaped = padded.reshape(ny, bs, nx, bs).transpose(0, 2, 1, 3)
+        flat_blocks = reshaped.reshape(-1, bs, bs)
 
-        for by in range(ny):
-            for bx in range(nx):
-                block = padded[by * bs : (by + 1) * bs, bx * bs : (bx + 1) * bs]
-                centered = block - 128.0
-                coeff = dct2(centered)
-                blocks.append(block)
-                coeff_blocks.append(coeff)
-                total_energy = float(np.sum(np.abs(coeff)))
-                hf_energy = float(np.sum(np.abs(coeff[2:, 2:]))) if bs > 2 else 0.0
-                st, anis = block_orientation_state(block)
-                mode = _mode_from_features(total_energy, hf_energy, anis, quality)
-                state_grid[by, bx] = st
-                mode_grid[by, bx] = mode
-                energy_grid[by, bx] = hf_energy + 1e-6
+        centered = flat_blocks - 128.0
+        coeff_blocks = dct2(centered)
+
+        total_energy = np.sum(np.abs(coeff_blocks), axis=(1, 2))
+        if bs > 2:
+            hf_energy = np.sum(np.abs(coeff_blocks[:, 2:, 2:]), axis=(1, 2))
+        else:
+            hf_energy = np.zeros(len(coeff_blocks))
+
+        states, anis = block_orientation_state(flat_blocks)
+        modes = _mode_from_features(total_energy, hf_energy, anis, quality)
+
+        state_grid = states.reshape(ny, nx)
+        mode_grid = modes.reshape(ny, nx)
+        energy_grid = (hf_energy + 1e-6).reshape(ny, nx)
 
         order_xy = build_fractal_order(state_grid, energy_grid)
         order = np.array([y * nx + x for (y, x) in order_xy], dtype=np.int32)
 
-        dct_qcoeffs = np.zeros((ny * nx, bs, bs), dtype=np.int16)
-        for idx, (y, x) in enumerate(order_xy):
-            bidx = y * nx + x
-            dct_qcoeffs[idx] = _quantize_dct(coeff_blocks[bidx], quality, int(mode_grid[y, x]))
+        # Reorder blocks for fractal traversal
+        ordered_coeffs = coeff_blocks[order]
+        ordered_modes = modes[order]
+
+        dct_qcoeffs = _quantize_dct(ordered_coeffs, quality, ordered_modes)
 
         # Reconstruct pass 1.
-        recon1 = np.zeros_like(padded, dtype=np.float64)
-        for idx, (y, x) in enumerate(order_xy):
-            qcoeff = dct_qcoeffs[idx]
-            mode = int(mode_grid[y, x])
-            coeff = _dequantize_dct(qcoeff, quality, mode)
-            block = idct2(coeff) + 128.0
-            recon1[y * bs : (y + 1) * bs, x * bs : (x + 1) * bs] = block
+        recon_coeffs = _dequantize_dct(dct_qcoeffs, quality, ordered_modes)
+        recon_blocks = idct2(recon_coeffs) + 128.0
+
+        # Put blocks back into grid
+        # First undo the fractal order
+        unordered_recon_blocks = np.zeros_like(recon_blocks)
+        unordered_recon_blocks[order] = recon_blocks
+
+        recon1 = unordered_recon_blocks.reshape(ny, nx, bs, bs).transpose(0, 2, 1, 3).reshape(h, w)
 
         residual = padded - recon1
         residual_coeffs: List[np.ndarray] = []
@@ -441,9 +506,16 @@ class FractalHybridCodec:
             resid = padded - current
             resid_pad, pad_info = pad_to_multiple(resid, 2 ** self.residual_levels, mode="reflect")
             coeffs, _ = haar_dwt2(resid_pad, levels=self.residual_levels)
-            # Quantize residual more gently than the block DCT stage.
-            qstep = max(0.20, _quality_to_qbase(quality) * (0.70 ** p) * 0.55)
-            qcoeffs = np.round(coeffs / qstep).astype(np.int16)
+            # Quantize residual.
+            # Increased qstep to improve compression.
+            qstep = max(0.5, _quality_to_qbase(quality) * (0.85 ** p) * 1.5)
+            qcoeffs = np.round(coeffs / qstep)
+            # Find appropriate integer type for residuals
+            c_min, c_max = qcoeffs.min(), qcoeffs.max()
+            if c_min >= -128 and c_max <= 127:
+                qcoeffs = qcoeffs.astype(np.int8)
+            else:
+                qcoeffs = qcoeffs.astype(np.int16)
             residual_coeffs.append(qcoeffs)
             residual_pads.append(pad_info)
             residual_qsteps.append(float(qstep))
@@ -458,7 +530,7 @@ class FractalHybridCodec:
             order=order,
             state_grid=state_grid,
             mode_grid=mode_grid,
-            dct_qcoeffs=dct_qcoeffs,
+            dct_qcoeffs_packed=_pack_coefficients(dct_qcoeffs),
             residual_pads=residual_pads,
             residual_qsteps=residual_qsteps,
             residual_coeffs=residual_coeffs,
@@ -468,15 +540,21 @@ class FractalHybridCodec:
         h, w = data.padded_shape
         bs = data.block_size
         ny, nx = h // bs, w // bs
-        recon = np.zeros((h, w), dtype=np.float64)
+        nblocks = ny * nx
 
-        order_xy = [(int(o // nx), int(o % nx)) for o in data.order]
-        for idx, (y, x) in enumerate(order_xy):
-            mode = int(data.mode_grid[y, x])
-            qcoeff = data.dct_qcoeffs[idx]
-            coeff = _dequantize_dct(qcoeff, data.quality, mode)
-            block = idct2(coeff) + 128.0
-            recon[y * bs : (y + 1) * bs, x * bs : (x + 1) * bs] = block
+        order = data.order
+        # We need modes in fractal order
+        flat_modes = data.mode_grid.ravel()
+        ordered_modes = flat_modes[order]
+
+        dct_qcoeffs = _unpack_coefficients(data.dct_qcoeffs_packed, nblocks, bs)
+        recon_coeffs = _dequantize_dct(dct_qcoeffs, data.quality, ordered_modes)
+        recon_blocks = idct2(recon_coeffs) + 128.0
+
+        # Put blocks back into grid
+        unordered_recon_blocks = np.zeros_like(recon_blocks)
+        unordered_recon_blocks[order] = recon_blocks
+        recon = unordered_recon_blocks.reshape(ny, nx, bs, bs).transpose(0, 2, 1, 3).reshape(h, w)
 
         for qcoeffs, qstep, pad_info in zip(data.residual_coeffs, data.residual_qsteps, data.residual_pads):
             resid = haar_idwt2(qcoeffs.astype(np.float64) * qstep, levels=self.residual_levels, pad=pad_info)
@@ -494,13 +572,25 @@ class FractalHybridCodec:
         if arr.dtype != np.uint8:
             arr = np.clip(np.round(arr), 0, 255).astype(np.uint8)
 
-        channels = split_channels(arr)
-        encoded_channels = [self._encode_channel(ch, quality) for ch in channels]
+        is_rgb = arr.ndim == 3 and arr.shape[2] == 3
+        if is_rgb:
+            channels = rgb_to_ycbcr(arr)
+        else:
+            channels = split_channels(arr)
+
+        encoded_channels = []
+        for i, ch in enumerate(channels):
+            # Chroma channels (Cb, Cr) can be quantized more aggressively
+            ch_quality = quality
+            if is_rgb and i > 0:
+                ch_quality = max(1, int(quality * 0.8))
+            encoded_channels.append(self._encode_channel(ch, ch_quality))
 
         payload = {
             "version": 1,
             "shape": tuple(arr.shape),
             "dtype": "uint8",
+            "is_rgb": is_rgb,
             "quality": int(np.clip(quality, 1, 100)),
             "block_size": self.block_size,
             "residual_levels": self.residual_levels,
@@ -516,15 +606,16 @@ class FractalHybridCodec:
         payload = pickle.loads(lzma.decompress(blob[len(MAGIC) :]))
         if payload.get("version") != 1:
             raise ValueError("Unsupported codec version")
-        if payload.get("block_size") != self.block_size:
-            # The stored data knows how it was encoded; this check is only advisory.
-            pass
 
         channels = []
         for ch_data in payload["channels"]:
             channels.append(self._decode_channel(ch_data))
-        out = stack_channels(channels)
-        out = np.clip(out, 0, 255).astype(np.uint8)
+
+        if payload.get("is_rgb") and len(channels) == 3:
+            out = ycbcr_to_rgb(channels[0], channels[1], channels[2])
+        else:
+            out = stack_channels(channels)
+            out = np.clip(out, 0, 255).astype(np.uint8)
         return out
 
 
