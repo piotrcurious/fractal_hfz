@@ -6,7 +6,7 @@ from skimage import data
 def test_ycbcr_roundtrip():
     img = data.astronaut()
     # Test without subsampling
-    channels = rgb_to_ycbcr(img, subsample=False)
+    channels = rgb_to_ycbcr(img)
     reconstructed = ycbcr_to_rgb(channels[0], channels[1], channels[2])
 
     diff = np.abs(img.astype(np.float64) - reconstructed.astype(np.float64))
@@ -14,6 +14,7 @@ def test_ycbcr_roundtrip():
 
     if np.max(diff) > 2:
         print("FAILED: Roundtrip (no subsample) difference too large")
+        assert False
     else:
         print("PASSED: YCbCr roundtrip (no subsample) successful")
 
