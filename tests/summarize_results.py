@@ -36,9 +36,9 @@ def generate_report(old_dir, new_dir, output_file):
         report += f"| {img} | {q} | {s1} | {s2} | {s_diff:+} | {p1:.2f} | {p2:.2f} | {p_diff:+.2f} |\n"
 
     report += "\n## Observations\n"
-    report += "- v3.4 introduces Extended-Basis Overlap-Add (EBOA) which significantly reduces bitstream size across all images.\n"
-    report += "- The smoother base reconstruction from EBOA allows for coarser Haar quantisation (1.60x) while maintaining competitive visual quality.\n"
-    report += "- Size savings range from ~1 KB up to ~8 KB per image, with an average PSNR reduction of only ~0.3-0.5 dB.\n"
+    report += "- v3.5 introduces Fractal-Basis Overlap-Add (FBOA) and adaptive blending search.\n"
+    report += "- The smoother base reconstruction from FBOA allows for even coarser Haar quantisation (1.75x).\n"
+    report += "- Significant size savings are achieved (up to 9 KB per image) with manageable quality trade-offs.\n"
 
     with open(output_file, "w") as f:
         f.write(report)
