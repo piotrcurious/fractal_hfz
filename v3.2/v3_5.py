@@ -1,4 +1,4 @@
-"""Hybrid fractal-Z image codec  (v3.6).
+"""Hybrid fractal-Z image codec  (v3.4).
 
 A transform-domain image compressor built around three layers:
 
@@ -10,13 +10,12 @@ A transform-domain image compressor built around three layers:
 3) Haar-wavelet residual — subband-selective scale map; optionally operates on
    the tighter fractal-prediction residual when Stage 2.5 fires.
 
-v3.6 additions:
-- Geometric Extrapolation Primitives: Introduces a set of greedy algorithms
-  (constant fill, gradient ramp, edge projection) alongside fractal scaling
-  for block extension.
-- Per-Block Primitive Selection: The encoder selects the best extrapolation
-  primitive for each block to minimize boundary discontinuities, enabling
-  smoother reconstructions and higher compression ratios.
+v3.4 additions:
+- Extended-Basis Overlap-Add (EBOA): DCT basis functions are evaluated on an
+  extended grid (e.g., 10x10 or 12x12 instead of 8x8) and blended using a
+  partition-of-unity window. This eliminates block artifacts in Stage 1 and
+  allows the multi-pass Haar stage to focus on true image detail rather than
+  correcting block boundaries, significantly improving compression ratio.
 
 The codec is self-contained (NumPy + stdlib only) and hackable.
 
@@ -24,8 +23,8 @@ Usage:
     python fractal_hfz_codec.py encode input.png output.hfz --quality 55
     python fractal_hfz_codec.py decode output.hfz reconstructed.png
 
-File format: LZMA-compressed pickle blob with 4-byte magic header (HFZ6).
-Backward-compatible with HFZ5, HFZ4, HFZ3, HFZ2, and HFZ1 blobs.
+File format: LZMA-compressed pickle blob with 4-byte magic header (HFZ4).
+Backward-compatible with HFZ3, HFZ2, and HFZ1 blobs.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-MAGIC    = b"HFZ6"   # v3.5: Fractal-Basis Overlap-Add (FBOA)
+MAGIC    = b"HFZ5"   # v3.5: Fractal-Basis Overlap-Add (FBOA)
 MAGIC_V2 = b"HFZ2"   # v2: multi-position DPCM + orientation steering
 MAGIC_V1 = b"HFZ1"
 
@@ -1771,7 +1770,7 @@ class FractalHybridCodec:
             encoded_channels.append(self._encode_channel(ch, ch_quality))
 
         payload = {
-            "version": 6,
+            "version": 5,
             "shape": tuple(arr.shape),
             "dtype": "uint8",
             "is_rgb": is_rgb,
@@ -1793,7 +1792,7 @@ class FractalHybridCodec:
             raise ValueError("Not a HFZ blob (unrecognised magic header)")
 
         version = payload.get("version", 1)
-        if version not in (1, 2, 3, 4, 5, 6):
+        if version not in (1, 2, 3, 4, 5):
             raise ValueError(f"Unsupported codec version {version}")
 
         channels = []
