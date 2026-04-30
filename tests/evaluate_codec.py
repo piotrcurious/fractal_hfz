@@ -14,7 +14,7 @@ def calculate_psnr(img1_path, img2_path):
         return float('inf')
     return 20 * np.log10(255.0 / np.sqrt(mse))
 
-def run_benchmark(codec_path, input_dir, output_dir, quality_levels=[25, 55, 85]):
+def run_benchmark(codec_path, input_dir, output_dir, quality_levels=[12, 25, 55, 85]):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

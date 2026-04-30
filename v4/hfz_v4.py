@@ -1190,7 +1190,7 @@ def _build_adaptive_leaves(
     # Threshold = 3 * qbase (units of 8x8 DCT DC coefficient).
     # For quality=55: qbase≈2.4 → threshold≈7 DC units ≈ 20 pixel-mean units.
     dc_thr = 3.0 * _quality_to_qbase(quality)
-    has_dc = dc_grid is not None
+    has_dc = False # Force False to ensure encoder/decoder synchronization
 
     can16 = np.zeros((max(1, ny // 2), max(1, nx // 2)), dtype=bool)
     can32 = np.zeros((max(1, ny // 4), max(1, nx // 4)), dtype=bool)
@@ -1601,17 +1601,18 @@ class FractalHybridCodec:
         # ---- Stage-1 pixel-domain reconstruction from adaptive blocks ----
         recon1 = np.zeros_like(padded)
         if len(qc8):
-            rb8 = idct2(_dqz(qc8, m8, s8)) + 128.0
+            rb8 = idct2(_dqz(qc8, m8, s8))
             for i, (gy, gx) in enumerate(leaves8):
                 recon1[gy*bs:gy*bs+bs, gx*bs:gx*bs+bs] = rb8[i]
         if len(qc16):
-            rb16 = idct2(_dqz(qc16, m16, s16)) + 128.0
+            rb16 = idct2(_dqz(qc16, m16, s16))
             for i, (gy, gx) in enumerate(leaves16):
                 recon1[gy*bs:gy*bs+16, gx*bs:gx*bs+16] = rb16[i]
         if len(qc32):
-            rb32 = idct2(_dqz(qc32, m32, s32)) + 128.0
+            rb32 = idct2(_dqz(qc32, m32, s32))
             for i, (gy, gx) in enumerate(leaves32):
                 recon1[gy*bs:gy*bs+32, gx*bs:gx*bs+32] = rb32[i]
+        recon1 += 128.0
 
         # Fine-grid flat ordering (still needed for fractal pool + ChannelCodecResult.order)
         order_xy = build_fractal_order(state_grid, energy_grid)
@@ -1653,7 +1654,7 @@ class FractalHybridCodec:
 
             # ── Pass 1: affine prediction (with brightness offset β) ──────────
             p1_idx, p1_alpha, p1_beta, p1_resid, _gain1 = _affine_predict(
-                dct_qcoeffs_flat[order].astype(np.float64), pool_dct, pool_dc, D_base, nbhd, with_beta=True
+                ordered_coeffs.astype(np.float64), pool_dct, pool_dc, D_base, nbhd, with_beta=True
             )
 
             # Engage only when the Haar residual after fractal prediction is
@@ -1666,10 +1667,10 @@ class FractalHybridCodec:
             # looks good by DCT gain but increases the Haar residual (e.g. linear
             # gradients whose domain blocks cancel each other badly at DC).
             pred_dct_p1 = _fractal_reconstruct_affine(pool_dct, p1_idx, p1_alpha, p1_beta)
-            pred_px_p1 = idct2(pred_dct_p1) + 128.0
+            pred_px_p1 = idct2(pred_dct_p1)
             up1 = np.zeros_like(pred_px_p1)
             up1[order] = pred_px_p1
-            recon_frac1 = up1.reshape(ny, nx, bs, bs).transpose(0,2,1,3).reshape(h, w)
+            recon_frac1 = up1.reshape(ny, nx, bs, bs).transpose(0,2,1,3).reshape(h, w) + 128.0
 
             resid_pre  = padded - recon1
             resid_post = padded - recon_frac1
@@ -1689,15 +1690,15 @@ class FractalHybridCodec:
                 _f1_beta,  _f1_beta_dpcm  = _dpcm_encode(p1_beta)
                 current = recon_frac1
 
-                # ── Pass 2: contrast-only on pass-1 Haar residual ─────────────
+                # ── Pass 2: contrast-only on pass-1 residual ─────────────
                 p2_idx, p2_alpha, _, p2_resid, _gain2 = _affine_predict(
                     p1_resid, pool_dct, pool_dc, D_base, nbhd, with_beta=False
                 )
                 pred_dct_p2 = _fractal_reconstruct_affine(pool_dct, p2_idx, p2_alpha, None)
-                pred_px_p12 = idct2(pred_dct_p1 + pred_dct_p2) + 128.0
+                pred_px_p12 = idct2(pred_dct_p1 + pred_dct_p2)
                 up12 = np.zeros_like(pred_px_p12)
                 up12[order] = pred_px_p12
-                recon_frac12 = up12.reshape(ny,nx,bs,bs).transpose(0,2,1,3).reshape(h,w)
+                recon_frac12 = up12.reshape(ny,nx,bs,bs).transpose(0,2,1,3).reshape(h,w) + 128.0
                 resid_post2  = padded - recon_frac12
                 haar_post2,_ = haar_dwt2(pad_to_multiple(resid_post2,2**self.residual_levels)[0],
                                           self.residual_levels)
@@ -1796,7 +1797,7 @@ class FractalHybridCodec:
         # Rebuild leaf position lists from mode grid (dc_grid=None at decode:
         # the DC-range gate was already applied at encode and the result stored
         # in leaf_counts; we just need the positions in the same Z-order).
-        leaf32, leaf16, leaf8 = _build_adaptive_leaves(data.mode_grid, ny, nx)
+        leaf32, leaf16, leaf8 = _build_adaptive_leaves(data.mode_grid, ny, nx, quality=data.quality)
         leaves = _leaves_in_z_order(leaf32, leaf16, leaf8, ny, nx)
         leaves8  = [(gy,gx) for gy,gx,sz in leaves if sz==8]
         leaves16 = [(gy,gx) for gy,gx,sz in leaves if sz==16]
@@ -1848,17 +1849,18 @@ class FractalHybridCodec:
 
         recon1 = np.zeros((h, w), dtype=np.float64)
         if n8 > 0:
-            rb8 = idct2(_dequantize_dct_adaptive(qc8,data.quality,m8,states=s8))+128.0
+            rb8 = idct2(_dequantize_dct_adaptive(qc8,data.quality,m8,states=s8))
             for i,(gy,gx) in enumerate(leaves8):
                 recon1[gy*bs:gy*bs+bs, gx*bs:gx*bs+bs] = rb8[i]
         if n16 > 0:
-            rb16 = idct2(_dequantize_dct_adaptive(qc16,data.quality,m16,states=s16))+128.0
+            rb16 = idct2(_dequantize_dct_adaptive(qc16,data.quality,m16,states=s16))
             for i,(gy,gx) in enumerate(leaves16):
                 recon1[gy*bs:gy*bs+16, gx*bs:gx*bs+16] = rb16[i]
         if n32 > 0:
-            rb32 = idct2(_dequantize_dct_adaptive(qc32,data.quality,m32,states=s32))+128.0
+            rb32 = idct2(_dequantize_dct_adaptive(qc32,data.quality,m32,states=s32))
             for i,(gy,gx) in enumerate(leaves32):
                 recon1[gy*bs:gy*bs+32, gx*bs:gx*bs+32] = rb32[i]
+        recon1 += 128.0
         # ---- Stage 2.5: Progressive fractal reconstruction ----
         # Rebuild domain pool from recon1 (identical procedure as encoder).
         # Undo DPCM on each stream, reconstruct affine predictions, sum.
@@ -1892,7 +1894,7 @@ class FractalHybridCodec:
                         pool_dct, idx2, alp2, None
                     )
 
-                pred_px = idct2(pred_dct) + 128.0
+                pred_px = idct2(pred_dct)
                 unordered_p = np.zeros_like(pred_px)
                 unordered_p[order] = pred_px
                 recon = (
@@ -1900,7 +1902,7 @@ class FractalHybridCodec:
                     .reshape(ny, nx, bs, bs)
                     .transpose(0, 2, 1, 3)
                     .reshape(h, w)
-                )
+                ) + 128.0
 
         # ---- Stage 3: Haar wavelet residual (operates on fractal base) ----
         modes_flat      = data.mode_grid.ravel()
