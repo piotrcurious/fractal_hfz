@@ -1,0 +1,130 @@
+[
+    {
+        "image": "astronaut",
+        "quality": 12,
+        "size": 107376,
+        "psnr": 33.60592873314711,
+        "encode_time": 2.6101040840148926,
+        "decode_time": 0.6231391429901123
+    },
+    {
+        "image": "astronaut",
+        "quality": 25,
+        "size": 130580,
+        "psnr": 35.60806074005449,
+        "encode_time": 2.601264476776123,
+        "decode_time": 0.6231350898742676
+    },
+    {
+        "image": "astronaut",
+        "quality": 55,
+        "size": 164944,
+        "psnr": 38.07080392952389,
+        "encode_time": 2.796130895614624,
+        "decode_time": 0.6878881454467773
+    },
+    {
+        "image": "astronaut",
+        "quality": 85,
+        "size": 187296,
+        "psnr": 39.343083731835854,
+        "encode_time": 2.9265084266662598,
+        "decode_time": 0.6281728744506836
+    },
+    {
+        "image": "camera",
+        "quality": 12,
+        "size": 61984,
+        "psnr": 36.300304525240406,
+        "encode_time": 1.1886777877807617,
+        "decode_time": 0.3928403854370117
+    },
+    {
+        "image": "camera",
+        "quality": 25,
+        "size": 70952,
+        "psnr": 38.84076393543585,
+        "encode_time": 1.1343169212341309,
+        "decode_time": 0.37624645233154297
+    },
+    {
+        "image": "camera",
+        "quality": 55,
+        "size": 86212,
+        "psnr": 41.70386514002175,
+        "encode_time": 1.179450273513794,
+        "decode_time": 0.3851144313812256
+    },
+    {
+        "image": "camera",
+        "quality": 85,
+        "size": 96708,
+        "psnr": 43.2894796217142,
+        "encode_time": 1.244842290878296,
+        "decode_time": 0.39226722717285156
+    },
+    {
+        "image": "coffee",
+        "quality": 12,
+        "size": 104544,
+        "psnr": 32.76442967622125,
+        "encode_time": 2.624842643737793,
+        "decode_time": 0.5756697654724121
+    },
+    {
+        "image": "coffee",
+        "quality": 25,
+        "size": 132328,
+        "psnr": 34.682689791344835,
+        "encode_time": 2.756143808364868,
+        "decode_time": 0.5910012722015381
+    },
+    {
+        "image": "coffee",
+        "quality": 55,
+        "size": 170264,
+        "psnr": 37.12511575316117,
+        "encode_time": 2.7452404499053955,
+        "decode_time": 0.5864591598510742
+    },
+    {
+        "image": "coffee",
+        "quality": 85,
+        "size": 197204,
+        "psnr": 38.45107112260821,
+        "encode_time": 3.9538888931274414,
+        "decode_time": 0.9517269134521484
+    },
+    {
+        "image": "moon",
+        "quality": 12,
+        "size": 17020,
+        "psnr": 40.43473951925067,
+        "encode_time": 1.3076822757720947,
+        "decode_time": 0.6007177829742432
+    },
+    {
+        "image": "moon",
+        "quality": 25,
+        "size": 20384,
+        "psnr": 41.864491380117315,
+        "encode_time": 1.3732609748840332,
+        "decode_time": 0.557607889175415
+    },
+    {
+        "image": "moon",
+        "quality": 55,
+        "size": 30140,
+        "psnr": 43.63628658061078,
+        "encode_time": 1.5816478729248047,
+        "decode_time": 0.5025506019592285
+    },
+    {
+        "image": "moon",
+        "quality": 85,
+        "size": 39828,
+        "psnr": 44.65469281164469,
+        "encode_time": 1.0138566493988037,
+        "decode_time": 0.3643810749053955
+    }
+]

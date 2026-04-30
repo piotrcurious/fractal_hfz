@@ -1,98 +1,130 @@
 [
     {
         "image": "astronaut",
+        "quality": 12,
+        "size": 109852,
+        "psnr": 33.64777185891452,
+        "encode_time": 2.753732442855835,
+        "decode_time": 1.3192415237426758
+    },
+    {
+        "image": "astronaut",
         "quality": 25,
         "size": 132988,
         "psnr": 35.59734726644145,
-        "encode_time": 3.2438485622406006,
-        "decode_time": 0.588444709777832
+        "encode_time": 2.8467857837677,
+        "decode_time": 0.5543150901794434
     },
     {
         "image": "astronaut",
         "quality": 55,
         "size": 167536,
         "psnr": 38.11245743970333,
-        "encode_time": 3.126260995864868,
-        "decode_time": 0.6174647808074951
+        "encode_time": 2.990872383117676,
+        "decode_time": 0.5918376445770264
     },
     {
         "image": "astronaut",
         "quality": 85,
         "size": 191636,
         "psnr": 39.39369898689978,
-        "encode_time": 3.4885482788085938,
-        "decode_time": 0.6849937438964844
+        "encode_time": 3.1141414642333984,
+        "decode_time": 0.5565407276153564
+    },
+    {
+        "image": "camera",
+        "quality": 12,
+        "size": 64692,
+        "psnr": 35.91987094529404,
+        "encode_time": 1.260582447052002,
+        "decode_time": 0.4223036766052246
     },
     {
         "image": "camera",
         "quality": 25,
         "size": 74928,
         "psnr": 38.417526264739756,
-        "encode_time": 1.466468334197998,
-        "decode_time": 0.42682957649230957
+        "encode_time": 1.2928950786590576,
+        "decode_time": 0.4058959484100342
     },
     {
         "image": "camera",
         "quality": 55,
         "size": 90900,
         "psnr": 41.36852272320161,
-        "encode_time": 1.4623644351959229,
-        "decode_time": 0.4154505729675293
+        "encode_time": 2.134298801422119,
+        "decode_time": 0.397918701171875
     },
     {
         "image": "camera",
         "quality": 85,
         "size": 102680,
         "psnr": 43.09194316259128,
-        "encode_time": 1.525721549987793,
-        "decode_time": 0.4162583351135254
+        "encode_time": 1.3376657962799072,
+        "decode_time": 0.36197924613952637
+    },
+    {
+        "image": "coffee",
+        "quality": 12,
+        "size": 107092,
+        "psnr": 32.62931516807252,
+        "encode_time": 2.6342055797576904,
+        "decode_time": 0.4786405563354492
     },
     {
         "image": "coffee",
         "quality": 25,
         "size": 134612,
         "psnr": 34.46418607339856,
-        "encode_time": 3.009174346923828,
-        "decode_time": 0.5289983749389648
+        "encode_time": 2.7486839294433594,
+        "decode_time": 0.48740291595458984
     },
     {
         "image": "coffee",
         "quality": 55,
         "size": 175384,
         "psnr": 37.030105439134765,
-        "encode_time": 3.16086745262146,
-        "decode_time": 0.5651931762695312
+        "encode_time": 2.8058362007141113,
+        "decode_time": 0.5109643936157227
     },
     {
         "image": "coffee",
         "quality": 85,
         "size": 202528,
         "psnr": 38.34176812274578,
-        "encode_time": 3.389158248901367,
-        "decode_time": 0.6030356884002686
+        "encode_time": 2.91109037399292,
+        "decode_time": 0.5127768516540527
+    },
+    {
+        "image": "moon",
+        "quality": 12,
+        "size": 18648,
+        "psnr": 40.416445717942715,
+        "encode_time": 1.0191752910614014,
+        "decode_time": 0.33142805099487305
     },
     {
         "image": "moon",
         "quality": 25,
         "size": 22188,
         "psnr": 41.78722897161866,
-        "encode_time": 1.0366322994232178,
-        "decode_time": 0.3675243854522705
+        "encode_time": 0.9554538726806641,
+        "decode_time": 0.3536348342895508
     },
     {
         "image": "moon",
         "quality": 55,
         "size": 32608,
         "psnr": 43.686318987246736,
-        "encode_time": 1.1239473819732666,
-        "decode_time": 0.3823249340057373
+        "encode_time": 1.03239107131958,
+        "decode_time": 0.3504948616027832
     },
     {
         "image": "moon",
         "quality": 85,
         "size": 43012,
         "psnr": 44.96515034880781,
-        "encode_time": 1.1824543476104736,
-        "decode_time": 0.5734450817108154
+        "encode_time": 1.087578296661377,
+        "decode_time": 0.3589468002319336
     }
 ]
